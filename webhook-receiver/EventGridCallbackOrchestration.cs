@@ -1,53 +1,111 @@
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.DurableTask;
+using Microsoft.Extensions.Logging;
 
 namespace Webhook.Receiver;
-public class EventGridCallbackOrchestration(HttpClient httpClient)
+public class EventGridCallbackOrchestration(ILogger<EventGridCallbackOrchestration> logger, HttpClient httpClient)
 {
+    private readonly ILogger _logger = logger;
     private readonly HttpClient _httpClient = httpClient;
     [Function(nameof(EventGridCallbackOrchestration))]
     public async Task RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context, string WebHookRequestCallback)
     {
-        var result = await context.CallActivityAsync<bool>(nameof(ValidateEventGridCallbackActivity), WebHookRequestCallback);
-        if (!result)
+        bool result;
+        try
         {
-            throw new InvalidOperationException("Failed to validate callback");
+            result = await context.CallActivityAsync<bool>(nameof(ValidateEventGridCallbackActivity), WebHookRequestCallback);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to validate callback");
+            throw new ApplicationException("Failed to validate callback", ex);
         }
 
-        Console.WriteLine("Callback validated successfully");
+        if (!result)
+        {
+            throw new InvalidOperationException("Failed to validate callback, null result");
+        }
+
+        _logger.LogInformation("Callback validated successfully");
     }
 
     [Function(nameof(ValidateEventGridCallbackActivity))]
-    public async Task<bool> ValidateEventGridCallbackActivity(
-        [ActivityTrigger] string WebHookRequestCallback)
+    public async Task ValidateEventGridCallbackActivity(
+        [ActivityTrigger] string WebHookRequestCallback, CancellationToken ct)
     {
-        var ct = new CancellationTokenSource(TimeSpan.FromSeconds(60)).Token;
+        Uri? webhookRequestCallbackUrl = null;
         try
         {
-            var WebHookRequestCallbackUrl = new Uri(WebHookRequestCallback);
-            Console.WriteLine($"Validating callback: {WebHookRequestCallbackUrl}");
+            webhookRequestCallbackUrl = new Uri(WebHookRequestCallback);
+            if (webhookRequestCallbackUrl is null)
+            {
+                throw new InvalidOperationException("WebHook-Request-Callback header is not a valid URL, returned null");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WebHook-Request-Callback header is not a valid URL");
+            throw new InvalidOperationException("WebHook-Request-Callback header is not a valid URL", ex);
+        }
 
-            await ValidateEventGridCallback(WebHookRequestCallbackUrl, 0, ct);
-            return true;
+        _logger.LogInformation($"Validating callback: {webhookRequestCallbackUrl}");
+
+
+        try
+        {
+            var callbackSuccessful = await ValidateEventGridCallback(webhookRequestCallbackUrl, 0, ct);
+            if (!callbackSuccessful)
+            {
+                throw new InvalidOperationException("Failed to validate callback, not successful");
+            }
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Failed to validate callback: {e}");
-            return false;
+            _logger.LogError(e, "Failed to validate callback");
+            throw new InvalidOperationException("Failed to validate callback", e);
         }
     }
 
-    private async Task ValidateEventGridCallback(Uri WebHookRequestCallbackUrl, int retryCount, CancellationToken ct)
+    private async Task<bool> ValidateEventGridCallback(Uri WebHookRequestCallbackUrl, int retryCount, CancellationToken ct)
     {
-        var callbackResponse = await _httpClient.GetAsync(WebHookRequestCallbackUrl, ct);
-        callbackResponse.EnsureSuccessStatusCode();
-        var callbackResponseBody = await callbackResponse.Content.ReadAsStringAsync(ct);
-        Console.WriteLine($"Callback response body: {callbackResponseBody}");
+        HttpResponseMessage? callbackResponse;
+        try
+        {
+            callbackResponse = await _httpClient.GetAsync(WebHookRequestCallbackUrl, ct);
+            if (!callbackResponse.IsSuccessStatusCode)
+            {
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to validate callback");
+            return false;
+        }
+
+        string? callbackResponseBody;
+        try
+        {
+            callbackResponseBody = await callbackResponse.Content.ReadAsStringAsync(ct);
+            if (callbackResponseBody is null)
+            {
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to read callback response body");
+            return false;
+        }
+
+        _logger.LogInformation("Callback response body: {callbackResponseBody}", callbackResponseBody);
+
+
         if (callbackResponseBody == "\"Webhook successfully validated as a subscription endpoint.\"")
         {
-            Console.WriteLine("Callback successfully validated");
-            return;
+            _logger.LogInformation("Callback validated successfully");
+            return true;
         }
 
         if (retryCount < 5)
@@ -55,10 +113,26 @@ public class EventGridCallbackOrchestration(HttpClient httpClient)
             var delay = TimeSpan.FromSeconds(Math.Pow(2, retryCount));
             Console.WriteLine($"Retrying callback in {delay}...");
             await Task.Delay(delay, ct);
-            await ValidateEventGridCallback(WebHookRequestCallbackUrl, retryCount + 1, ct);
-            return;
+
+            try
+            {
+                var callbackResult = await ValidateEventGridCallback(WebHookRequestCallbackUrl, retryCount + 1, ct);
+                if (!callbackResult)
+                {
+                    _logger.LogError("Failed to validate callback after {retryCount} retries", retryCount);
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to validate callback");
+                return false;
+            }
+
+            return true;
         }
 
-        throw new InvalidOperationException($"Failed to validate callback after {retryCount} retries");
+        _logger.LogError("Failed to validate callback after {retryCount} retries", retryCount);
+        return false;
     }
 }
