@@ -29,7 +29,21 @@ public class Webhook(ILogger<Webhook> logger, HttpClient httpClient)
 
     private async Task<HttpResponseData> RunOptions(HttpRequestData req, DurableTaskClient durableTaskClient, CancellationToken ct)
     {
-        var WebHookRequestOrigin = GetHeaderValue(req, "WebHook-Request-Origin");
+        string? WebHookRequestOrigin;
+        try
+        {
+            WebHookRequestOrigin = GetHeaderValue(req, "WebHook-Request-Origin");
+            if (string.IsNullOrEmpty(WebHookRequestOrigin))
+            {
+                throw new InvalidOperationException("WebHook-Request-Origin header is empty");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WebHook-Request-Origin header not found");
+            return req.CreateResponse(HttpStatusCode.BadRequest);
+        }
+
         return WebHookRequestOrigin switch
         {
             "eventgrid.azure.net" => await ValidateEventGridWebhook(req, durableTaskClient, WebHookRequestOrigin, ct),
@@ -39,15 +53,66 @@ public class Webhook(ILogger<Webhook> logger, HttpClient httpClient)
 
     private async Task<HttpResponseData> ValidateEventGridWebhook(HttpRequestData req, DurableTaskClient durableTaskClient, string WebHookRequestOrigin, CancellationToken ct)
     {
-        var WebHookRequestCallback = GetHeaderValue(req, "WebHook-Request-Callback");
-        var WebHookRequestCallbackUrl = new Uri(WebHookRequestCallback);
-        if (!WebHookRequestCallbackUrl.DnsSafeHost.EndsWith("eventgrid.azure.net"))
+        string? webHookRequestCallback = null;
+        try
         {
+            webHookRequestCallback = GetHeaderValue(req, "WebHook-Request-Callback");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WebHook-Request-Callback header not found");
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
-        string durableTaskInstanceId = await durableTaskClient.ScheduleNewOrchestrationInstanceAsync(nameof(EventGridCallbackOrchestration), WebHookRequestCallback);
-        var res = await durableTaskClient.CreateCheckStatusResponseAsync(req, durableTaskInstanceId);
+        Uri? webHookRequestCallbackUrl = null;
+        try
+        {
+            webHookRequestCallbackUrl = new Uri(webHookRequestCallback);
+            if (webHookRequestCallbackUrl is null)
+            {
+                throw new InvalidOperationException("WebHook-Request-Callback header is not a valid URL, returned null");
+            }
+
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WebHook-Request-Callback header is not a valid URL");
+            return req.CreateResponse(HttpStatusCode.BadRequest);
+        }
+
+        if (!webHookRequestCallbackUrl.DnsSafeHost.EndsWith("eventgrid.azure.net"))
+        {
+            _logger.LogError("WebHook-Request-Callback header is not a valid URL");
+            return req.CreateResponse(HttpStatusCode.BadRequest);
+        }
+
+        string durableTaskInstanceId;
+        try
+        {
+            durableTaskInstanceId = await durableTaskClient.ScheduleNewOrchestrationInstanceAsync(nameof(EventGridCallbackOrchestration), webHookRequestCallback, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start orchestration");
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
+        }
+
+        HttpResponseData? res = null;
+        try
+        {
+            res = await durableTaskClient.CreateCheckStatusResponseAsync(req, durableTaskInstanceId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create check status response");
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
+        }
+
+        if (res is null)
+        {
+            _logger.LogError("Failed to create check status response");
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
+        }
 
         Console.WriteLine($"Started orchestration with ID = '{durableTaskInstanceId}'.");
 
