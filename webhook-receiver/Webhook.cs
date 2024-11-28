@@ -5,6 +5,7 @@ using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
 using System.Net;
 using System.Text;
+using static Utils.Invoke;
 
 namespace Webhook.Receiver;
 
@@ -29,94 +30,73 @@ public class Webhook(ILogger<Webhook> logger, HttpClient httpClient)
 
     private async Task<HttpResponseData> RunOptions(HttpRequestData req, DurableTaskClient durableTaskClient, CancellationToken ct)
     {
-        string? WebHookRequestOrigin;
-        try
+        var webhookRequestOriginResult = TryInvokeNotNull(() => GetHeaderValue(req, "WebHook-Request-Origin"));
+        if (!webhookRequestOriginResult.IsSuccessful)
         {
-            WebHookRequestOrigin = GetHeaderValue(req, "WebHook-Request-Origin");
-            if (string.IsNullOrEmpty(WebHookRequestOrigin))
-            {
-                throw new InvalidOperationException("WebHook-Request-Origin header is empty");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WebHook-Request-Origin header not found");
+            _logger.LogError(webhookRequestOriginResult.Error, "WebHook-Request-Origin header not found");
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
-        return WebHookRequestOrigin switch
+        var webhookRequestOrigin = webhookRequestOriginResult.Value;
+        if (webhookRequestOrigin != "eventgrid.azure.net")
         {
-            "eventgrid.azure.net" => await ValidateEventGridWebhook(req, durableTaskClient, WebHookRequestOrigin, ct),
-            _ => req.CreateResponse(HttpStatusCode.BadRequest),
-        };
+            _logger.LogError("WebHook-Request-Origin header is not a valid URL: {WebHookRequestOrigin}", webhookRequestOrigin);
+            return req.CreateResponse(HttpStatusCode.BadRequest);
+        }
+
+        var validateEventGridWebhookResult = await TryInvoke(() => ValidateEventGridWebhook(req, durableTaskClient, webhookRequestOrigin, ct));
+        if (!validateEventGridWebhookResult.IsSuccessful)
+        {
+            _logger.LogError(validateEventGridWebhookResult.Error, "Failed to validate event grid webhook");
+            return req.CreateResponse(HttpStatusCode.InternalServerError);
+        }
+
+        return validateEventGridWebhookResult.Value;
     }
 
-    private async Task<HttpResponseData> ValidateEventGridWebhook(HttpRequestData req, DurableTaskClient durableTaskClient, string WebHookRequestOrigin, CancellationToken ct)
+    private async Task<HttpResponseData> ValidateEventGridWebhook(HttpRequestData req, DurableTaskClient durableTaskClient, string webhookRequestOrigin, CancellationToken ct)
     {
-        string? webHookRequestCallback = null;
-        try
+
+        var webhookRequestCallbackResult = TryInvokeNotNull(() => GetHeaderValue(req, "WebHook-Request-Callback"));
+        if (!webhookRequestCallbackResult.IsSuccessful)
         {
-            webHookRequestCallback = GetHeaderValue(req, "WebHook-Request-Callback");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WebHook-Request-Callback header not found");
+            _logger.LogError(webhookRequestCallbackResult.Error, "WebHook-Request-Callback header not found");
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
-        Uri? webHookRequestCallbackUrl = null;
-        try
+        var webhookRequestCallback = webhookRequestCallbackResult.Value;
+        var webHookRequestCallbackUrlResult = TryInvokeNotNull(() => new Uri(webhookRequestCallback));
+        if (!webHookRequestCallbackUrlResult.IsSuccessful)
         {
-            webHookRequestCallbackUrl = new Uri(webHookRequestCallback);
-            if (webHookRequestCallbackUrl is null)
-            {
-                throw new InvalidOperationException("WebHook-Request-Callback header is not a valid URL, returned null");
-            }
-
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WebHook-Request-Callback header is not a valid URL");
+            _logger.LogError(webHookRequestCallbackUrlResult.Error, "WebHook-Request-Callback header is not a valid URL: {WebHookRequestCallback}", webhookRequestCallback);
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
+        var webHookRequestCallbackUrl = webHookRequestCallbackUrlResult.Value;
         if (!webHookRequestCallbackUrl.DnsSafeHost.EndsWith("eventgrid.azure.net"))
         {
             _logger.LogError("WebHook-Request-Callback header is not a valid URL");
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
-        string durableTaskInstanceId;
-        try
+        var durableTaskInstanceIdResult = await TryInvoke(() => durableTaskClient.ScheduleNewOrchestrationInstanceAsync(nameof(EventGridCallbackOrchestration), webhookRequestCallback, ct));
+        if (!durableTaskInstanceIdResult.IsSuccessful)
         {
-            durableTaskInstanceId = await durableTaskClient.ScheduleNewOrchestrationInstanceAsync(nameof(EventGridCallbackOrchestration), webHookRequestCallback, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to start orchestration");
+            _logger.LogError(durableTaskInstanceIdResult.Error, "Failed to start orchestration");
             return req.CreateResponse(HttpStatusCode.InternalServerError);
         }
 
-        HttpResponseData? res = null;
-        try
+        var durableTaskInstanceId = durableTaskInstanceIdResult.Value;
+        var checkStatusResponseResult = await TryInvokeNotNull(() => durableTaskClient.CreateCheckStatusResponseAsync(req, durableTaskInstanceId));
+        if (!checkStatusResponseResult.IsSuccessful)
         {
-            res = await durableTaskClient.CreateCheckStatusResponseAsync(req, durableTaskInstanceId);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to create check status response");
+            _logger.LogError(checkStatusResponseResult.Error, "Failed to create check status response");
             return req.CreateResponse(HttpStatusCode.InternalServerError);
         }
 
-        if (res is null)
-        {
-            _logger.LogError("Failed to create check status response");
-            return req.CreateResponse(HttpStatusCode.InternalServerError);
-        }
+        _logger.LogInformation("Started orchestration with ID = '{DurableTaskInstanceId}'", durableTaskInstanceId);
 
-        Console.WriteLine($"Started orchestration with ID = '{durableTaskInstanceId}'.");
-
-        return res;
+        return checkStatusResponseResult.Value;
     }
 
     private static async Task<HttpResponseData> RunPost(HttpRequestData req, CancellationToken ct)
